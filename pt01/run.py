@@ -31,7 +31,7 @@ def download_corpus():
         return f.read()
 
 
-def tokenize(text):
+def get_all_words(text):
     text = text.casefold().replace("ё", "е")
     return WORD_RE.findall(text)
 
@@ -131,12 +131,10 @@ def get_perplexity(lm: LM, words):
     for alpha in [1, 0.1, 0.01]:
         lm.alpha = alpha
         nll = 0.0
-        count = 0
         for v, w in zip(words, words[1:]):
             nll -= math.log(lm.prob(v, w))
-            count += 1
+        count = len(words[1:])
         perplexities[str(alpha)] = math.exp(nll / count) if count else float("inf")
-
     lm.alpha = saved_alpha 
     return perplexities
 
@@ -169,6 +167,21 @@ def compute_bigram_artifacts(all_words):
 def word_to_chars(word):
     return list(word) + ["</w>"]
 
+
+def get_best_pair(word_counts, vocab):
+    pair_counts = Counter()
+    for w, symbols in vocab.items():
+        f = word_counts[w]
+        for a, b in zip(symbols, symbols[1:]):
+            pair_counts[(a, b)] += f
+    if not pair_counts:
+        return None
+    best_pair, best_count = max(pair_counts.items(), key=lambda kv: (kv[1], kv[0]))
+    if best_count < 2:
+        return None
+    return best_pair
+
+
 def learn_bpe(word_counts: dict, num_merges):
     # word_freqs: dict word -> freq (word is raw string)
     # Represent each word as list of symbols
@@ -176,15 +189,8 @@ def learn_bpe(word_counts: dict, num_merges):
     merges = []
 
     for _ in range(num_merges):
-        pair_counts = Counter()
-        for w, symbols in vocab.items():
-            f = word_counts[w]
-            for a, b in zip(symbols, symbols[1:]):
-                pair_counts[(a, b)] += f
-        if not pair_counts:
-            break
-        best_pair, best_count = max(pair_counts.items(), key=lambda kv: (kv[1], kv[0]))
-        if best_count < 2:
+        best_pair = get_best_pair(word_counts, vocab)
+        if best_pair is None:
             break
         a, b = best_pair
         new_symbol = a + b
@@ -234,16 +240,16 @@ def compute_bpe_artifacts(all_words, num_merges):
 
     # Stats on all words (use raw word list, including low freq)
     chars = 0
-    total_tokens_bpe = 0
+    tokens_bpe = 0
     words = 0
     for w, c in word_counts.items():
         chars += len(w) * c
         words += c
         toks = apply_bpe(w, merge_ranks)
-        total_tokens_bpe += len(toks) * c
+        tokens_bpe += len(toks) * c
 
-    tokens_per_word = total_tokens_bpe / words if words else 0
-    compression = total_tokens_bpe / chars if chars else 0
+    tokens_per_word = tokens_bpe / words if words else 0
+    compression = chars / tokens_bpe if tokens_bpe else 0
 
     # Examples
     example_words = ["наполеон", "сказала", "неудовольствие"]
@@ -265,11 +271,11 @@ def compute_bpe_artifacts(all_words, num_merges):
         "stats": {
             "chars": chars,
             "words": words,
-            "tokens_bpe": total_tokens_bpe,
+            "tokens_bpe": tokens_bpe,
             "tokens_per_word": tokens_per_word,
             "compression_vs_chars": compression,
-            "examples": examples,
         },
+        "examples": examples,
     }
     return bpe
 
@@ -282,12 +288,11 @@ def main() -> None:
     ARTIFACTS.mkdir(exist_ok=True)
 
     text = download_corpus()
-    all_words = tokenize(text)
+    all_words = get_all_words(text)
 
     bigram = compute_bigram_artifacts(all_words)
     with open(ARTIFACTS / "bigram.json", "w", encoding="utf-8") as f:
         json.dump(bigram, f, ensure_ascii=False, indent=2)
-
     num_merges = 200 if args.fast else 1500
     if args.num_merges:
         num_merges = args.num_merges
