@@ -36,8 +36,9 @@ def get_all_words(text):
     return WORD_RE.findall(text)
 
 
-class LM:
+class BigramLM:
     def __init__(self, alpha=0.01):
+        self.context_length = 1
         self.alpha = alpha
         self.word_counts = Counter()
         self.bigram_counts = Counter()
@@ -86,7 +87,53 @@ class LM:
             result.append(v)
         return result
 
-def get_generations(lm: LM):
+
+class TrigramLM:
+    def __init__(self, alpha=0.01, alpha_bigram=0.01):
+        self.context_length = 2
+        self.alpha = alpha
+        self.bigram = BigramLM(alpha=alpha_bigram)   # для отката
+        self.triple_counts = Counter()
+        self.context_pair_counts = Counter()
+
+    def fit(self, words):
+        self.bigram.fit(words)
+        self.triple_counts = Counter(zip(words, words[1:], words[2:]))
+        self.context_pair_counts = Counter(zip(words, words[1:]))
+        self.vocab = self.bigram.vocab
+        self.vocab_set = self.bigram.vocab_set
+        self.vocab_size = self.bigram.vocab_size
+
+    def prob(self, u, v, w):
+        if (u, v, w) not in self.triple_counts:
+            return self.bigram.prob(v, w)      # откат
+        c_uv = self.context_pair_counts.get((u, v), 0)
+        c_uvw = self.triple_counts.get((u, v, w), 0)
+        return (c_uvw + self.alpha) / (c_uv + self.alpha * self.vocab_size)
+
+    def generate(self, start, length=30, temperature=1.0, seed=SEED):
+        if seed is not None:
+            np.random.seed(seed)
+        if start not in self.vocab_set:
+           raise ValueError("Слова нет в словаре")
+        # Генерируем второе слово биграмной моделью
+        result = self.bigram.generate(start, 2, temperature=temperature, seed=seed)
+        u, v = result
+        for _ in range(length - 2):
+            probs = np.array([self.prob(u, v, w) for w in self.vocab], dtype=np.float64)
+            if temperature != 1.0:
+                probs = np.power(probs, 1.0 / temperature)
+            total = probs.sum()
+            if total <= 0 or not np.isfinite(total):
+                raise ValueError("Сумма вероятностей должна быть положительным числом")
+            probs = probs / total
+            w = self.vocab[np.random.choice(len(self.vocab), p=probs)]
+            result.append(w)
+            u, v = v, w                    # сдвиг контекста
+        return result
+
+
+def get_generations(lm):
     generations = []
     for start in ["князь", "она"]:
         for temperature in [0.5, 1, 2]:
@@ -99,7 +146,7 @@ def get_generations(lm: LM):
     return generations
 
 
-def get_likelihood(lm: LM, words, sentence_len=12, alpha=0.01):
+def get_likelihood(lm, words, sentence_len=12, alpha=0.01):
     # Likelihood comparison
     sentence = words[:sentence_len]
     shuffled = sentence[:]
@@ -124,16 +171,23 @@ def get_likelihood(lm: LM, words, sentence_len=12, alpha=0.01):
     lm.alpha = saved_alpha    
     return likelihood
 
-def get_perplexity(lm: LM, words):
+def get_perplexity(lm, words, alpha_values):
     # Perplexity on validation for several alphas
     saved_alpha = lm.alpha
     perplexities = {}
-    for alpha in [1, 0.1, 0.01]:
+    for alpha in alpha_values:
         lm.alpha = alpha
         nll = 0.0
-        for v, w in zip(words, words[1:]):
-            nll -= math.log(lm.prob(v, w))
-        count = len(words[1:])
+        if lm.context_length == 1:
+            for v, w in zip(words, words[1:]):
+                nll -= math.log(lm.prob(v, w))
+            count = len(words[1:])
+        elif lm.context_length == 2:
+            for u, v, w in zip(words, words[1:], words[2:]):
+                nll -= math.log(lm.prob(u, v, w))
+            count = len(words[2:])
+        else:
+            raise ValueError("Не определена длина контекста")
         perplexities[str(alpha)] = math.exp(nll / count) if count else float("inf")
     lm.alpha = saved_alpha 
     return perplexities
@@ -144,13 +198,15 @@ def compute_bigram_artifacts(all_words):
     train_words = all_words[:split]
     val_words = all_words[split:]
 
-    lm = LM(alpha=0.01)
+    lm = BigramLM(alpha=0.01)
     lm.fit(train_words)
 
     top20 = [[w, c] for w, c in lm.word_counts.most_common(20)]
+
     generations = get_generations(lm)
     likelihood = get_likelihood(lm, val_words, sentence_len=12, alpha=0.01)
-    perplexity = get_perplexity(lm, val_words)
+    alpha_values = [1, 0.1, 0.01]
+    perplexity = get_perplexity(lm, val_words, alpha_values)
     bigram = {
             "corpus": CORPUS_URL,
             "words": n,
@@ -279,11 +335,56 @@ def compute_bpe_artifacts(all_words, num_merges):
     }
     return bpe
 
+def backoff_rate_on_trajectory(lm, words):
+    """Доля шагов траектории, где (u,v,w) отсутствует в triple_counts."""
+    triples = list(zip(words, words[1:], words[2:]))
+    if not triples:
+        return 0.0, 0, 0
+    unseen = sum(1 for (u, v, w) in triples if (u, v, w) not in lm.triple_counts)
+    return unseen / len(triples), unseen, len(triples)
+
+
+def get_lm_comparison(all_words):
+    n = len(all_words)
+    split = int(n * 0.9)
+    train_words = all_words[:split]
+    val_words = all_words[split:]
+
+    alpha_values = [1, 0.1, 0.01, 0.001, 0.0001, 0.00001, 0.000001, 0.0000001, 0.00000001, 0.000000001]
+    
+    bigram_lm = BigramLM(alpha=0.01)
+    bigram_lm.fit(train_words)
+    bigram_generations = get_generations(bigram_lm)
+    bigram_perplexity = get_perplexity(bigram_lm, val_words, alpha_values)
+
+    trigram_lm = TrigramLM(alpha=0.01)
+    trigram_lm.fit(train_words)
+    trigram_generations = get_generations(trigram_lm)
+    trigram_perplexity = get_perplexity(trigram_lm, val_words, alpha_values)
+    
+    # Вычисляем долю откатов на биграмную модель
+    for item in trigram_generations:
+        rate, unseen, total = backoff_rate_on_trajectory(trigram_lm, item["text"].split())
+        item["rate"] = rate
+        item["unseen"] = unseen
+        item["total"] = total
+
+    result = {
+                "perplexity": {"bigram": bigram_perplexity,
+                               "trigram": trigram_perplexity,
+                },
+                "generation": { "bigram": bigram_generations,
+                                "trigram": trigram_generations,
+                }
+            }
+    return result
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="быстрый режим для CI")
     ap.add_argument("--num_merges", help="Количество мержей", type=int)
+    ap.add_argument("--bonus_1", action="store_true", help="Сравнение биграмную и триграмную модели: перплексия, генерация")
     args = ap.parse_args()
     ARTIFACTS.mkdir(exist_ok=True)
 
@@ -293,6 +394,7 @@ def main() -> None:
     bigram = compute_bigram_artifacts(all_words)
     with open(ARTIFACTS / "bigram.json", "w", encoding="utf-8") as f:
         json.dump(bigram, f, ensure_ascii=False, indent=2)
+    
     num_merges = 200 if args.fast else 1500
     if args.num_merges:
         num_merges = args.num_merges
@@ -300,6 +402,11 @@ def main() -> None:
     with open(ARTIFACTS / "bpe.json", "w", encoding="utf-8") as f:
         json.dump(bpe, f, ensure_ascii=False, indent=2)
 
+    # Бонус 1 Сравнение биграмную и триграмную модели: перплексия, генерация
+    if args.bonus_1: 
+        lm_comparison = get_lm_comparison(all_words)
+        with open(ARTIFACTS / "lm_comparison.json", "w", encoding="utf-8") as f:
+            json.dump(lm_comparison, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
     main()
