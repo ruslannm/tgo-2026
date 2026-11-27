@@ -88,8 +88,8 @@ class LM:
 
 def get_generations(lm: LM):
     generations = []
-    for temperature in [0.5, 1, 2]:
-        for start in ["князь", "она"]:
+    for start in ["князь", "она"]:
+        for temperature in [0.5, 1, 2]:
             words = lm.generate(start, length=30, temperature=temperature, seed=SEED)
             generations.append({
                 "temperature": temperature,
